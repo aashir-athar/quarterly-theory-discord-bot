@@ -393,14 +393,31 @@ def sleep_until(target: datetime) -> None:
         time.sleep(min(remaining, 30))
 
 
-def run(cfg: Config) -> None:
+def run(
+    cfg: Config,
+    duration_seconds: Optional[int] = None,
+    state_file: Optional[Path] = None,
+) -> None:
+    if duration_seconds is not None and duration_seconds <= 0:
+        raise ValueError("duration_seconds must be positive")
+
+    deadline = None
+    if duration_seconds is not None:
+        deadline = utcnow() + timedelta(seconds=duration_seconds)
+    if state_file is not None:
+        check_once(cfg, state_file)
+
     state = snapshot(utcnow())
     log.info("Quarterly Theory bot online · timeframes: %s", ", ".join(cfg.timeframes))
     if cfg.snapshot_on_start:
-        post(cfg, snapshot_payload(cfg, state))
+        if not post(cfg, snapshot_payload(cfg, state)):
+            raise RuntimeError("Failed to post the startup snapshot.")
 
-    while True:
+    while deadline is None or utcnow() < deadline:
         target = min(state[tf].end for tf in cfg.timeframes)
+        if deadline is not None and target > deadline:
+            sleep_until(deadline)
+            break
         log.info("Next phase shift: %s PKT", fmt(target))
         sleep_until(target)
 
@@ -409,15 +426,26 @@ def run(cfg: Config) -> None:
         changes = [(state[tf], new[tf]) for tf in cfg.timeframes if state[tf].key != new[tf].key]
         state = new
         if not changes:
+            if state_file is not None:
+                save_check_time(state_file, now)
             continue
 
         late = (now - target).total_seconds()
         if late > cfg.max_late:
             log.warning("Woke %.0fs late (system asleep?) - skipping stale alert and resyncing.", late)
+            if state_file is not None:
+                save_check_time(state_file, now)
             continue
 
         ok = post(cfg, transition_payload(cfg, target, changes))
         log.info("Sent %d card(s) for %s PKT - %s", len(changes), fmt(target), "ok" if ok else "FAILED")
+        if not ok:
+            raise RuntimeError(f"Failed to post the phase shift at {target.isoformat()}.")
+        if state_file is not None:
+            save_check_time(state_file, target)
+
+    if deadline is not None:
+        log.info("Bot run window ended after %d seconds.", duration_seconds)
 
 
 def check_once(cfg: Config, state_file: Path) -> None:
@@ -513,7 +541,13 @@ def main() -> None:
         "--state-file",
         type=Path,
         default=Path(".quarterly-bot-state.json"),
-        help="state file used by --check",
+        help="state file used by --check and bounded runs",
+    )
+    ap.add_argument(
+        "--run-for-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="run the scheduler for a limited time, then exit cleanly",
     )
     ap.add_argument("--next", type=int, metavar="N", help="list the next N phase shifts and exit")
     ap.add_argument("--at", metavar='"YYYY-MM-DD HH:MM"', help="preview the shift at a PKT time and exit")
@@ -532,6 +566,8 @@ def main() -> None:
         except RuntimeError as exc:
             sys.exit(str(exc))
         return
+    if args.run_for_seconds is not None and args.run_for_seconds <= 0:
+        ap.error("--run-for-seconds must be greater than zero")
     if args.snapshot:
         if not post(cfg, snapshot_payload(cfg, snapshot(utcnow()))):
             sys.exit(1)
@@ -539,9 +575,16 @@ def main() -> None:
     if not cfg.webhook_url and not cfg.dry_run:
         sys.exit("Set DISCORD_WEBHOOK_URL in .env first (see .env.example).")
     try:
-        run(cfg)
+        run(
+            cfg,
+            duration_seconds=args.run_for_seconds,
+            state_file=args.state_file if args.run_for_seconds is not None else None,
+        )
     except KeyboardInterrupt:
         log.info("Stopped.")
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

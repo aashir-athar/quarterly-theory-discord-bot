@@ -38,11 +38,11 @@ or `pm2 start quarterly_bot.py --interpreter python`.
 
 ## Run automatically with GitHub Actions
 
-The included workflow checks for phase shifts every five hours (at 00:00, 05:00, 10:00,
-15:00, and 20:00 UTC) and can post a live snapshot when started manually. GitHub-hosted runners are short-lived, so the workflow
-uses a small Actions cache to remember its last check rather than keeping a process open.
-GitHub scheduled workflows are best-effort and can be delayed; alerts are skipped if
-the workflow has been inactive longer than `MAX_LATE_SECONDS`.
+The scheduled workflow runs the bot continuously for five hours, then exits cleanly.
+GitHub Actions starts scheduled workflows hourly; concurrency allows only one bot run
+at a time, so the latest scheduled run waits to restart the bot when the current run
+finishes. A small Actions cache preserves the last processed phase shift across restarts.
+GitHub schedules and queued runs are best-effort and can be delayed.
 
 1. Add `DISCORD_WEBHOOK_URL` under the repository's **Settings → Secrets and variables
    → Actions → New repository secret**. Never commit `.env` or paste a webhook URL into
@@ -52,6 +52,6 @@ the workflow has been inactive longer than `MAX_LATE_SECONDS`.
 3. Keep the workflow enabled in the repository's **Actions** tab. Use
    **Quarterly Theory Discord Bot → Run workflow** to post a snapshot on demand.
 
-The workflow catches up on phase shifts since its previous run for up to six hours
-(`MAX_LATE_SECONDS=21600` by default). This is a periodic job, not a continuously running
-process, and GitHub does not guarantee exact schedule timing.
+The bot catches up on phase shifts since its previous run for up to six hours
+(`MAX_LATE_SECONDS=21600` by default). It is restarted periodically rather than running
+forever, and GitHub does not guarantee exact schedule timing or uninterrupted service.
