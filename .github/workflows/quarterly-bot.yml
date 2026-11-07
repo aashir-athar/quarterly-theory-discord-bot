@@ -2,7 +2,7 @@ name: Quarterly Theory Discord Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 */5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -24,7 +24,7 @@ jobs:
       TIMEFRAMES: ${{ vars.TIMEFRAMES || 'yearly,monthly,weekly,daily,micro' }}
       SHOW_UTC: ${{ vars.SHOW_UTC || 'false' }}
       SNAPSHOT_ON_START: "false"
-      MAX_LATE_SECONDS: ${{ vars.MAX_LATE_SECONDS || '1800' }}
+      MAX_LATE_SECONDS: ${{ vars.MAX_LATE_SECONDS || '21600' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
