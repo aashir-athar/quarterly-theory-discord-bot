@@ -24,7 +24,7 @@ jobs:
       TIMEFRAMES: ${{ vars.TIMEFRAMES || 'yearly,monthly,weekly,daily,micro' }}
       SHOW_UTC: ${{ vars.SHOW_UTC || 'false' }}
       SNAPSHOT_ON_START: "false"
-      MAX_LATE_SECONDS: "1800"
+      MAX_LATE_SECONDS: ${{ vars.MAX_LATE_SECONDS || '1800' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
