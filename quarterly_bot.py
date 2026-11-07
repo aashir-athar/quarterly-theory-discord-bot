@@ -17,6 +17,7 @@ Usage
 -----
     python quarterly_bot.py                  run forever, post to the webhook
     python quarterly_bot.py --snapshot       post the live board once and exit
+    python quarterly_bot.py --tick           one-shot pass for cron / GitHub Actions
     python quarterly_bot.py --next 12        list the next 12 phase shifts
     python quarterly_bot.py --at "2026-11-09 05:00"   preview the shift at a PKT time
     add --dry-run to any command to print the payload instead of posting
@@ -32,7 +33,6 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 import requests
@@ -224,7 +224,8 @@ def transition_embed(prev: Window, new: Window, show_utc: bool) -> dict:
         return {
             "author": author,
             "title": "⚪ Weekly cycle complete",
-            "description": f"✔ ~~{qname(prev)}~~ closed\n\n> Market week is done. Review, journal, reset.",
+            "description": (f"✔ ~~{qname(prev)}~~ closed\n\n" if prev is not None and prev.q is not None else "")
+            + "> Market week is done. Review, journal, reset.",
             "color": IDLE_COLOR,
             "fields": [
                 {"name": "⏭ Resumes", "value": f"**{fmt(new.end)}**\n{rel(new.end)}", "inline": False},
@@ -234,11 +235,13 @@ def transition_embed(prev: Window, new: Window, show_utc: bool) -> dict:
 
     ph = new.phase
     live = f"▶ **{qname(new)}** live"
-    if new.q == 0 and prev is not None and prev.q is not None:
-        live += " · 🔁 new cycle"
-    if prev is not None and prev.q is not None:
+    if prev is None:  # catch-up card: we don't know the immediate predecessor
+        desc = live
+    elif prev.q is not None:
+        if new.q == 0:
+            live += " · 🔁 new cycle"
         desc = f"✔ ~~{qname(prev)}~~ closed\n{live}"
-    else:
+    else:  # coming out of the weekend break
         desc = f"{live} · 🔁 new cycle"
     desc += f"\n\n> {ph.brief}"
 
@@ -257,9 +260,11 @@ def transition_embed(prev: Window, new: Window, show_utc: bool) -> dict:
     }
 
 
-def transition_payload(cfg: "Config", at: datetime, changes: list[tuple[Window, Window]]) -> dict:
+def transition_payload(
+    cfg: "Config", at: datetime, changes: list[tuple[Optional[Window], Window]], note: str = ""
+) -> dict:
     embeds = [transition_embed(p, n, cfg.show_utc) for p, n in changes]
-    head = f"🔔 **Phase shift** · {fmt(at)} PKT"
+    head = f"🔔 **Phase shift** · {fmt(at)} PKT{note}"
     if cfg.role_id:
         head = f"<@&{cfg.role_id}> {head}"
     return _envelope(cfg, head, embeds)
@@ -320,6 +325,7 @@ class Config:
     snapshot_on_start: bool
     max_late: int
     dry_run: bool = False
+    max_catchup: int = 6
 
 
 def load_config(dry_run: bool) -> Config:
@@ -339,6 +345,7 @@ def load_config(dry_run: bool) -> Config:
         snapshot_on_start=_env_bool("SNAPSHOT_ON_START", True),
         max_late=int(os.getenv("MAX_LATE_SECONDS", "600")),
         dry_run=dry_run,
+        max_catchup=int(os.getenv("MAX_CATCHUP", "6")),
     )
 
 
@@ -393,31 +400,14 @@ def sleep_until(target: datetime) -> None:
         time.sleep(min(remaining, 30))
 
 
-def run(
-    cfg: Config,
-    duration_seconds: Optional[int] = None,
-    state_file: Optional[Path] = None,
-) -> None:
-    if duration_seconds is not None and duration_seconds <= 0:
-        raise ValueError("duration_seconds must be positive")
-
-    deadline = None
-    if duration_seconds is not None:
-        deadline = utcnow() + timedelta(seconds=duration_seconds)
-    if state_file is not None:
-        check_once(cfg, state_file)
-
+def run(cfg: Config) -> None:
     state = snapshot(utcnow())
     log.info("Quarterly Theory bot online · timeframes: %s", ", ".join(cfg.timeframes))
     if cfg.snapshot_on_start:
-        if not post(cfg, snapshot_payload(cfg, state)):
-            raise RuntimeError("Failed to post the startup snapshot.")
+        post(cfg, snapshot_payload(cfg, state))
 
-    while deadline is None or utcnow() < deadline:
+    while True:
         target = min(state[tf].end for tf in cfg.timeframes)
-        if deadline is not None and target > deadline:
-            sleep_until(deadline)
-            break
         log.info("Next phase shift: %s PKT", fmt(target))
         sleep_until(target)
 
@@ -426,79 +416,83 @@ def run(
         changes = [(state[tf], new[tf]) for tf in cfg.timeframes if state[tf].key != new[tf].key]
         state = new
         if not changes:
-            if state_file is not None:
-                save_check_time(state_file, now)
             continue
 
         late = (now - target).total_seconds()
         if late > cfg.max_late:
             log.warning("Woke %.0fs late (system asleep?) - skipping stale alert and resyncing.", late)
-            if state_file is not None:
-                save_check_time(state_file, now)
             continue
 
         ok = post(cfg, transition_payload(cfg, target, changes))
         log.info("Sent %d card(s) for %s PKT - %s", len(changes), fmt(target), "ok" if ok else "FAILED")
-        if not ok:
-            raise RuntimeError(f"Failed to post the phase shift at {target.isoformat()}.")
-        if state_file is not None:
-            save_check_time(state_file, target)
-
-    if deadline is not None:
-        log.info("Bot run window ended after %d seconds.", duration_seconds)
 
 
-def check_once(cfg: Config, state_file: Path) -> None:
-    now = utcnow()
-    if not state_file.exists():
-        save_check_time(state_file, now)
-        log.info("No prior check state; initialized at %s UTC.", now.isoformat())
-        return
-
-    try:
-        saved = json.loads(state_file.read_text(encoding="utf-8"))
-        last_check = datetime.fromisoformat(saved["last_check"])
-        if last_check.tzinfo is None:
-            raise ValueError("last_check must include a timezone")
-        last_check = last_check.astimezone(UTC)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise RuntimeError(f"Could not read check state from {state_file}: {exc}") from exc
-
-    if last_check > now:
-        raise RuntimeError(f"Check state in {state_file} is in the future.")
-    if (now - last_check).total_seconds() > cfg.max_late:
-        log.warning("Check state is stale; skipping old shifts and resyncing.")
-        save_check_time(state_file, now)
-        return
-
-    cursor = last_check
-    while True:
-        before = snapshot(cursor)
-        target = min(before[tf].end for tf in cfg.timeframes)
-        if target > now:
+def boundaries_between(cfg: Config, start: datetime, end: datetime, limit: int = 100000) -> list[datetime]:
+    """Every phase-shift instant t with start < t <= end (all enabled timeframes)."""
+    out, t = [], start
+    while len(out) < limit:
+        nxt = min(ENGINE[tf](t).end for tf in cfg.timeframes)
+        if nxt > end:
             break
-
-        after = snapshot(target)
-        changes = [
-            (before[tf], after[tf])
-            for tf in cfg.timeframes
-            if before[tf].key != after[tf].key
-        ]
-        if changes and not post(cfg, transition_payload(cfg, target, changes)):
-            raise RuntimeError(f"Failed to post the phase shift at {target.isoformat()}.")
-        cursor = target
-        save_check_time(state_file, cursor)
-
-    save_check_time(state_file, now)
-    log.info("Checked phase shifts through %s UTC.", now.isoformat())
+        out.append(nxt)
+        t = nxt
+    return out
 
 
-def save_check_time(state_file: Path, checked_at: datetime) -> None:
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(
-        json.dumps({"last_check": checked_at.astimezone(UTC).isoformat()}),
-        encoding="utf-8",
-    )
+def _load_state(path: str) -> Optional[datetime]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return datetime.fromisoformat(json.load(fh)["last_checked"]).astimezone(UTC)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_state(path: str, when: datetime) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"last_checked": when.astimezone(UTC).isoformat(), "note": "managed by quarterly_bot.py"}, fh)
+
+
+def tick(cfg: Config, state_path: str, now: Optional[datetime] = None) -> int:
+    """One stateless pass for cron / GitHub Actions. Returns a process exit code."""
+    now = now or utcnow()
+    last = _load_state(state_path)
+
+    if last is None:  # very first run: remember "now", show the live board, no history spam
+        log.info("No state yet - initialising at %s PKT", fmt(now))
+        if cfg.snapshot_on_start and not post(cfg, snapshot_payload(cfg, snapshot(now))):
+            return 1
+        _save_state(state_path, now)
+        return 0
+
+    if last > now:  # clock skew - never go backwards
+        last = now
+
+    bounds = boundaries_between(cfg, last, now)
+    if not bounds:
+        log.info("No phase shift since %s PKT", fmt(last))
+        return 0  # state untouched, so the workflow makes no commit on quiet runs
+
+    log.info("%d boundary(ies) since %s PKT", len(bounds), fmt(last))
+
+    if len(bounds) > cfg.max_catchup:  # long outage: one collapsed card instead of a flood
+        before, after = snapshot(last), snapshot(now)
+        changes = [(None, after[tf]) for tf in cfg.timeframes if before[tf].key != after[tf].key]
+        ok = post(cfg, transition_payload(cfg, bounds[-1], changes, " · catch-up"))
+        if ok:
+            _save_state(state_path, now)
+        return 0 if ok else 1
+
+    for b in bounds:
+        before, after = snapshot(b - timedelta(seconds=1)), snapshot(b)
+        changes = [(before[tf], after[tf]) for tf in cfg.timeframes if before[tf].key != after[tf].key]
+        if not changes:
+            continue
+        if not post(cfg, transition_payload(cfg, b, changes)):
+            return 1  # state stays at the last success, the next run retries from here
+        _save_state(state_path, b)
+        time.sleep(1)  # stay well under Discord's webhook rate limit
+    _save_state(state_path, now)
+    return 0
 
 
 def list_next(cfg: Config, n: int) -> None:
@@ -528,63 +522,40 @@ def preview_at(cfg: Config, when_pkt: str) -> None:
     if not changes:
         print("No phase shift at that exact minute. Use --next 10 to see real boundaries.")
         return
-    if not post(cfg, transition_payload(cfg, at, changes)):
-        sys.exit(1)
+    post(cfg, transition_payload(cfg, at, changes))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Quarterly Theory Discord webhook bot (PKT display)")
     ap.add_argument("--dry-run", action="store_true", help="print payloads instead of posting")
     ap.add_argument("--snapshot", action="store_true", help="post the live board once and exit")
-    ap.add_argument("--check", action="store_true", help="check for phase shifts since the last run and exit")
-    ap.add_argument(
-        "--state-file",
-        type=Path,
-        default=Path(".quarterly-bot-state.json"),
-        help="state file used by --check and bounded runs",
-    )
-    ap.add_argument(
-        "--run-for-seconds",
-        type=int,
-        metavar="SECONDS",
-        help="run the scheduler for a limited time, then exit cleanly",
-    )
     ap.add_argument("--next", type=int, metavar="N", help="list the next N phase shifts and exit")
     ap.add_argument("--at", metavar='"YYYY-MM-DD HH:MM"', help="preview the shift at a PKT time and exit")
+    ap.add_argument("--tick", action="store_true", help="one-shot run for cron / GitHub Actions (uses --state)")
+    ap.add_argument("--state", default="state.json", help="state file used by --tick (default: state.json)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
     cfg = load_config(args.dry_run)
 
+    if args.tick:
+        if not cfg.webhook_url and not cfg.dry_run:
+            sys.exit("DISCORD_WEBHOOK_URL is not set (add it as a repository secret).")
+        sys.exit(tick(cfg, args.state))
+
     if args.next:
         return list_next(cfg, args.next)
     if args.at:
         return preview_at(cfg, args.at)
-    if args.check:
-        try:
-            check_once(cfg, args.state_file)
-        except RuntimeError as exc:
-            sys.exit(str(exc))
-        return
-    if args.run_for_seconds is not None and args.run_for_seconds <= 0:
-        ap.error("--run-for-seconds must be greater than zero")
     if args.snapshot:
-        if not post(cfg, snapshot_payload(cfg, snapshot(utcnow()))):
-            sys.exit(1)
+        post(cfg, snapshot_payload(cfg, snapshot(utcnow())))
         return
     if not cfg.webhook_url and not cfg.dry_run:
         sys.exit("Set DISCORD_WEBHOOK_URL in .env first (see .env.example).")
     try:
-        run(
-            cfg,
-            duration_seconds=args.run_for_seconds,
-            state_file=args.state_file if args.run_for_seconds is not None else None,
-        )
+        run(cfg)
     except KeyboardInterrupt:
         log.info("Stopped.")
-    except RuntimeError as exc:
-        log.error("%s", exc)
-        sys.exit(1)
 
 
 if __name__ == "__main__":

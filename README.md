@@ -6,18 +6,52 @@ shift at the same moment they arrive together as one message.
 
 Boundaries follow the chart in UTC. Everything shown in Discord is Pakistan time (PKT, UTC+5).
 
-## Setup
+---
+
+## Fully automated on GitHub (no server, no PC left on)
+
+A GitHub Actions workflow runs every 5 minutes, posts any phase shift since its last run,
+and remembers its place on a branch called `state` so nothing is ever sent twice.
+
+1. **Create the webhook** in Discord: Channel > Edit Channel > Integrations > Webhooks > New Webhook > Copy Webhook URL.
+2. **Create a public GitHub repo** and upload every file in this folder, including the
+   `.github/workflows/` folder (the hidden folder must be uploaded, or use `git push`).
+3. **Add the webhook as a secret** (never put it in a file; the repo is public):
+   Repo > Settings > Secrets and variables > Actions > **Secrets** > New repository secret
+   Name: `DISCORD_WEBHOOK_URL` · Value: your webhook URL.
+4. **Allow the workflow to save state**:
+   Repo > Settings > Actions > General > Workflow permissions > **Read and write permissions** > Save.
+5. **Start it**: Repo > Actions > "Quarterly Theory alerts" > **Run workflow**.
+   The first run posts the live board and creates the `state` branch. After that it is hands-off.
+
+Optional settings go in Settings > Secrets and variables > Actions > **Variables**
+(not Secrets): `MENTION_ROLE_ID`, `BOT_AVATAR_URL`, `BOT_NAME`, `TIMEFRAMES`
+(any of `yearly,monthly,weekly,daily,micro`), `SHOW_UTC`, `SNAPSHOT_ON_START`.
+
+### Things to know about GitHub Actions
+- **Alerts can be a few minutes late.** GitHub's scheduler is best-effort and can start runs 5-30 minutes
+  after the scheduled time at busy periods. The card always shows the true shift time.
+- **Nothing is lost if a run is skipped.** The next run delivers any missed shift once. After a long
+  outage (more than 6 missed shifts) you get one "catch-up" card with the current phases.
+- **Inactivity:** GitHub pauses scheduled workflows in a public repo after 60 days without repo
+  activity. The bot commits to the `state` branch about every 90 minutes, which should count, but if
+  alerts ever stop, open the Actions tab and press "Enable workflow".
+- **Public repo:** only the code is public. The webhook URL stays hidden in Secrets. Never commit a `.env`.
+- Actions minutes are free for public repos.
+
+---
+
+## Run it locally instead
 ```
 pip install -r requirements.txt
-copy .env.example .env      # Windows   (cp on Linux/Mac)
-# put your webhook URL in .env
+copy .env.example .env      # Windows   (cp on Linux/Mac), then put your webhook URL in .env
 python quarterly_bot.py
 ```
 
-## Commands
 | Command | What it does |
 |---|---|
-| `python quarterly_bot.py` | Run forever and post at every shift |
+| `python quarterly_bot.py` | Run forever on your own machine and post at every shift |
+| `python quarterly_bot.py --tick` | One pass: post anything new since the last run (what the workflow uses) |
 | `python quarterly_bot.py --snapshot` | Post the live board (current phase of every cycle) |
 | `python quarterly_bot.py --next 12` | List the next 12 shifts in PKT |
 | `python quarterly_bot.py --at "2026-11-09 05:00"` | Post the card for the shift at that PKT time |
@@ -31,27 +65,3 @@ python quarterly_bot.py
 - Micro: 16 slots of 90 minutes a day, four per session, exactly as in the chart
 
 In PKT the day starts at 05:00, so Asia = 05:00, London = 11:00, New York AM = 17:00, New York PM = 23:00.
-
-## Keep it running
-It must be running to send alerts. Use a VPS, or on Windows Task Scheduler "At startup",
-or `pm2 start quarterly_bot.py --interpreter python`.
-
-## Run automatically with GitHub Actions
-
-The scheduled workflow runs the bot continuously for five hours, then exits cleanly.
-GitHub Actions starts scheduled workflows hourly; concurrency allows only one bot run
-at a time, so the latest scheduled run waits to restart the bot when the current run
-finishes. A small Actions cache preserves the last processed phase shift across restarts.
-GitHub schedules and queued runs are best-effort and can be delayed.
-
-1. Add `DISCORD_WEBHOOK_URL` under the repository's **Settings → Secrets and variables
-   → Actions → New repository secret**. Never commit `.env` or paste a webhook URL into
-   workflow files.
-2. Optionally add repository Actions variables such as `BOT_NAME`, `BOT_AVATAR_URL`,
-   `MENTION_ROLE_ID`, `TIMEFRAMES`, and `SHOW_UTC`.
-3. Keep the workflow enabled in the repository's **Actions** tab. Use
-   **Quarterly Theory Discord Bot → Run workflow** to post a snapshot on demand.
-
-The bot catches up on phase shifts since its previous run for up to six hours
-(`MAX_LATE_SECONDS=21600` by default). It is restarted periodically rather than running
-forever, and GitHub does not guarantee exact schedule timing or uninterrupted service.

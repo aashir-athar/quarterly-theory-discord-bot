@@ -1,6 +1,5 @@
 .env
-.quarterly-bot-state.json
+state.json
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
-venv/

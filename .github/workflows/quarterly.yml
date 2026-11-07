@@ -1,0 +1,70 @@
+name: Quarterly Theory alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # GitHub's shortest interval; runs can start a few minutes late
+  workflow_dispatch: # manual "Run workflow" button for testing
+
+permissions:
+  contents: write # needed only to save state.json on the `state` branch
+
+concurrency:
+  group: quarterly-bot
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Load state
+        run: |
+          if git fetch --depth=1 origin state && git show FETCH_HEAD:state.json > state.json 2>/dev/null; then
+            echo "Loaded state: $(cat state.json)"
+          else
+            echo "No saved state yet (first run)"
+            rm -f state.json
+          fi
+
+      - name: Check for phase shifts and post to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MENTION_ROLE_ID: ${{ vars.MENTION_ROLE_ID }}
+          BOT_AVATAR_URL: ${{ vars.BOT_AVATAR_URL }}
+          BOT_NAME: ${{ vars.BOT_NAME || 'Quarterly Theory' }}
+          TIMEFRAMES: ${{ vars.TIMEFRAMES || 'yearly,monthly,weekly,daily,micro' }}
+          SHOW_UTC: ${{ vars.SHOW_UTC || 'false' }}
+          SNAPSHOT_ON_START: ${{ vars.SNAPSHOT_ON_START || 'true' }}
+        run: python quarterly_bot.py --tick --state state.json
+
+      - name: Save state
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          cp state.json "$RUNNER_TEMP/state.json"
+          rm -f state.json
+          git config user.name "quarterly-bot"
+          git config user.email "quarterly-bot@users.noreply.github.com"
+          if git fetch origin state; then
+            git checkout -q -B state FETCH_HEAD
+          else
+            git checkout -q --orphan state
+            git rm -rfq . || true
+          fi
+          cp "$RUNNER_TEMP/state.json" state.json
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "State unchanged"
+          else
+            git commit -qm "state: $(date -u +%FT%TZ)"
+            git push origin state
+          fi
