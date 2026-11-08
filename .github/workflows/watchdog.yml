@@ -1,0 +1,32 @@
+name: Watchdog
+
+# Safety net: once an hour, make sure a 5-hour bot run is alive or queued.
+# If the chain ever broke (GitHub outage, failed run), this starts it again.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  revive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Start the bot if nothing is running
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          active=0
+          for s in in_progress queued pending waiting requested; do
+            n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow quarterly.yml --status "$s" --json databaseId --jq length)
+            active=$((active + n))
+          done
+          echo "Active or queued bot runs: $active"
+          if [ "$active" -eq 0 ]; then
+            echo "Chain was broken - restarting"
+            gh workflow run quarterly.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
+          fi

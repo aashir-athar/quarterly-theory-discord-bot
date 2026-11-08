@@ -1,21 +1,24 @@
 name: Quarterly Theory alerts
 
+# One run stays alive for 5 hours posting every phase shift on time. Just before it
+# ends it starts the next run (queued behind it), so the bot is always on.
+# watchdog.yml restarts the chain if it ever breaks. To stop the bot, cancel the live run.
+
 on:
-  schedule:
-    - cron: "*/5 * * * *" # GitHub's shortest interval; runs can start a few minutes late
-  workflow_dispatch: # manual "Run workflow" button for testing
+  workflow_dispatch: # press "Run workflow" once to start the chain
 
 permissions:
-  contents: write # needed only to save state.json on the `state` branch
+  contents: write # save state.json on the `state` branch
+  actions: write # let the run start its own successor
 
 concurrency:
-  group: quarterly-bot
+  group: quarterly-bot # only one run is live; the successor waits in the queue
   cancel-in-progress: false
 
 jobs:
-  tick:
+  serve:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 345 # hard cap, GitHub's own limit is 360
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +38,9 @@ jobs:
             rm -f state.json
           fi
 
-      - name: Check for phase shifts and post to Discord
+      - name: Run the bot for 5 hours
         env:
+          PUSH_STATE: "1"
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MENTION_ROLE_ID: ${{ vars.MENTION_ROLE_ID }}
           BOT_AVATAR_URL: ${{ vars.BOT_AVATAR_URL }}
@@ -44,27 +48,14 @@ jobs:
           TIMEFRAMES: ${{ vars.TIMEFRAMES || 'yearly,monthly,weekly,daily,micro' }}
           SHOW_UTC: ${{ vars.SHOW_UTC || 'false' }}
           SNAPSHOT_ON_START: ${{ vars.SNAPSHOT_ON_START || 'true' }}
-        run: python quarterly_bot.py --tick --state state.json
+        run: python quarterly_bot.py --serve 300 --state state.json
 
-      - name: Save state
-        if: always()
-        run: |
-          [ -f state.json ] || exit 0
-          cp state.json "$RUNNER_TEMP/state.json"
-          rm -f state.json
-          git config user.name "quarterly-bot"
-          git config user.email "quarterly-bot@users.noreply.github.com"
-          if git fetch origin state; then
-            git checkout -q -B state FETCH_HEAD
-          else
-            git checkout -q --orphan state
-            git rm -rfq . || true
-          fi
-          cp "$RUNNER_TEMP/state.json" state.json
-          git add state.json
-          if git diff --cached --quiet; then
-            echo "State unchanged"
-          else
-            git commit -qm "state: $(date -u +%FT%TZ)"
-            git push origin state
-          fi
+      - name: Save final state
+        if: ${{ !cancelled() }}
+        run: bash scripts/save_state.sh state.json
+
+      - name: Start the next 5-hour run
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run quarterly.yml --ref "${{ github.ref_name }}"

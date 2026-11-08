@@ -19,15 +19,18 @@ with GitHub Actions or continuously on your own machine.
 - Combined notifications when multiple cycles change together.
 - Discord embeds show phase, cycle window, next phase, and relative end time.
 - Optional role mentions, custom bot name and avatar, and UTC timestamps.
-- GitHub Actions workflow runs every five minutes and stores delivery state on a
-  separate `state` branch to avoid reposting already processed shifts.
+- GitHub Actions can keep the bot running in five-hour sessions, hand off to the
+  next session, and use an hourly watchdog to restart a broken chain.
+- Delivery state is stored on a separate `state` branch to avoid reposting
+  already processed shifts.
 - Preview the live board, upcoming phase boundaries, or a specific transition.
 
 ## Run automatically with GitHub Actions
 
-The public repository includes a scheduled workflow. GitHub-hosted runners start
-short-lived jobs; the workflow checks for phase changes and exits. GitHub scheduling
-is best-effort, so a run may start late.
+The public repository includes a self-restarting GitHub Actions workflow. Each run
+keeps the bot online for five hours, then queues its successor. An hourly watchdog
+restarts the chain if a run fails to hand off. GitHub-hosted runners are still
+temporary, and GitHub does not guarantee uninterrupted service or exact start times.
 
 ### Setup
 
@@ -38,8 +41,10 @@ is best-effort, so a run may start late.
 3. Under **Settings → Actions → General → Workflow permissions**, allow read and
    write permissions so the workflow can save its deduplication state to the `state`
    branch.
-4. Open **Actions → Quarterly Theory alerts** and select **Run workflow** to start
-   it. The first run posts the live board by default and initializes state.
+4. Open **Actions → Quarterly Theory alerts** and select **Run workflow** once to
+   start the bot chain. The first run posts the live board by default and initializes
+   state. You can stop the chain by cancelling the active run; the watchdog may
+   restart it if the workflow remains enabled.
 
 Optional settings can be added under **Settings → Secrets and variables → Actions
 → Variables**:
@@ -55,10 +60,13 @@ Optional settings can be added under **Settings → Secrets and variables → Ac
 
 ### Scheduling and delivery notes
 
-- The workflow is scheduled every five minutes, but GitHub may delay or skip
-  scheduled runs. It is not a guaranteed real-time or continuously running service.
-- The next successful run checks saved state and posts phase changes it can recover.
-  After a long gap, multiple missed boundaries are collapsed into one catch-up alert.
+- Each serving job is capped at 345 minutes by GitHub Actions and runs the bot for
+  five hours before queuing the next session.
+- The watchdog checks hourly. GitHub may delay or skip scheduled jobs, so this is
+  best-effort automation, not guaranteed 24/7 infrastructure.
+- The bot saves delivery state on the `state` branch and catches up on missed phase
+  changes after restarts. To start fresh instead of replaying old state, delete that
+  branch before the first run; the bot will initialize a new live snapshot.
 - GitHub can disable scheduled workflows in inactive repositories. If alerts stop,
   check the Actions tab and re-enable the workflow if needed.
 - Only source code and workflow configuration are public. Keep `.env` and webhook
@@ -94,6 +102,7 @@ The local `.env` file is ignored by Git. Never commit a real webhook URL.
 |---|---|
 | `python quarterly_bot.py` | Run continuously and post alerts |
 | `python quarterly_bot.py --tick` | Check once for new phase changes using saved state |
+| `python quarterly_bot.py --serve 300 --state state.json` | Run the scheduler for 300 minutes, then exit |
 | `python quarterly_bot.py --snapshot` | Post the current live board |
 | `python quarterly_bot.py --next 12` | List the next 12 phase boundaries in PKT |
 | `python quarterly_bot.py --at "2026-11-09 05:00"` | Preview/post a transition at a PKT time |
@@ -129,6 +138,8 @@ replace the `DISCORD_WEBHOOK_URL` GitHub secret immediately.
 ```text
 .
 ├── .github/workflows/quarterly.yml  # Scheduled GitHub Actions workflow
+├── .github/workflows/watchdog.yml   # Restarts the workflow chain if needed
+├── scripts/save_state.sh            # Persists state to the state branch
 ├── .env.example                     # Local configuration template
 ├── .gitignore                       # Excludes secrets and generated state
 ├── quarterly_bot.py                 # Cycle calculations and Discord delivery

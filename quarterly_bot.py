@@ -17,7 +17,8 @@ Usage
 -----
     python quarterly_bot.py                  run forever, post to the webhook
     python quarterly_bot.py --snapshot       post the live board once and exit
-    python quarterly_bot.py --tick           one-shot pass for cron / GitHub Actions
+    python quarterly_bot.py --serve 300      stay alive 5 hours, then exit (GitHub Actions)
+    python quarterly_bot.py --tick           one-shot pass for cron
     python quarterly_bot.py --next 12        list the next 12 phase shifts
     python quarterly_bot.py --at "2026-11-09 05:00"   preview the shift at a PKT time
     add --dry-run to any command to print the payload instead of posting
@@ -29,6 +30,7 @@ import calendar
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -495,6 +497,56 @@ def tick(cfg: Config, state_path: str, now: Optional[datetime] = None) -> int:
     return 0
 
 
+def _push_state(path: str) -> None:
+    """Commit state.json to the `state` branch (only when PUSH_STATE=1, i.e. inside GitHub Actions)."""
+    if os.getenv("PUSH_STATE") != "1":
+        return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "save_state.sh")
+    try:
+        r = subprocess.run(["bash", script, path], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            log.warning("Saving state failed: %s", (r.stderr or r.stdout).strip()[:300])
+    except Exception as exc:  # never let bookkeeping kill the alerts
+        log.warning("Saving state failed: %s", exc)
+
+
+def serve(cfg: Config, state_path: str, minutes: float) -> int:
+    """Stay alive for `minutes`, posting each phase shift on time, then exit cleanly.
+
+    Used by the self-restarting GitHub workflow: the next run's first tick catches up on
+    anything that fell between two runs, so the hand-off never loses or repeats an alert.
+    """
+    deadline = utcnow() + timedelta(minutes=minutes)
+    log.info("Serving until %s PKT (%.0f min)", fmt(deadline), minutes)
+    retry = False
+    first = True
+    while True:
+        if first:  # catch up on anything missed since the last run
+            first = False
+        else:
+            if utcnow() >= deadline:
+                break
+            if retry:
+                time.sleep(30)
+            else:
+                now = utcnow()
+                nxt = min(ENGINE[tf](now).end for tf in cfg.timeframes)
+                log.info("Next phase shift: %s PKT", fmt(nxt))
+                sleep_until(min(nxt, deadline))
+                if nxt > deadline:
+                    break
+                time.sleep(1)  # make sure the clock is past the boundary
+        before = _load_state(state_path)
+        rc = tick(cfg, state_path)
+        retry = rc != 0
+        if retry:
+            log.warning("Post failed - retrying in 30s")
+        if _load_state(state_path) != before:
+            _push_state(state_path)
+    log.info("5-hour window finished - handing over to the next run")
+    return 0
+
+
 def list_next(cfg: Config, n: int) -> None:
     t = utcnow()
     for _ in range(n):
@@ -532,16 +584,20 @@ def main() -> None:
     ap.add_argument("--next", type=int, metavar="N", help="list the next N phase shifts and exit")
     ap.add_argument("--at", metavar='"YYYY-MM-DD HH:MM"', help="preview the shift at a PKT time and exit")
     ap.add_argument("--tick", action="store_true", help="one-shot run for cron / GitHub Actions (uses --state)")
-    ap.add_argument("--state", default="state.json", help="state file used by --tick (default: state.json)")
+    ap.add_argument("--serve", type=float, metavar="MINUTES", help="stay alive for MINUTES, posting on time, then exit")
+    ap.add_argument("--state", default="state.json", help="state file used by --tick/--serve (default: state.json)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
     cfg = load_config(args.dry_run)
 
-    if args.tick:
+    if args.tick or args.serve:
         if not cfg.webhook_url and not cfg.dry_run:
             sys.exit("DISCORD_WEBHOOK_URL is not set (add it as a repository secret).")
-        sys.exit(tick(cfg, args.state))
+        try:
+            sys.exit(serve(cfg, args.state, args.serve) if args.serve else tick(cfg, args.state))
+        except KeyboardInterrupt:
+            sys.exit(0)
 
     if args.next:
         return list_next(cfg, args.next)
